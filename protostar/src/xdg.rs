@@ -1,85 +1,70 @@
 use color_eyre::eyre::Result;
+use freedesktop_icons_greedy::lookup;
+use itertools::Itertools;
 use lazy_static::lazy_static;
-use linicon;
 use regex::Regex;
 use resvg::render;
 use resvg::tiny_skia::{Pixmap, Transform};
 use resvg::usvg::{FitTo, Tree};
 use serde::{Deserialize, Serialize};
-use serde_json;
 use serde_with::serde_as;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::create_dir_all;
-use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::{env, fs};
-
 use walkdir::WalkDir;
+
 #[serde_as]
 #[derive(Deserialize, Serialize)]
 struct ImageCache {
 	path: PathBuf,
 	#[serde_as(as = "Vec<(_, _)>")]
-	pub map: HashMap<String, PathBuf>,
+	pub map: HashMap<(String, u16), PathBuf>,
 }
 
 impl ImageCache {
 	fn new(path: PathBuf) -> Self {
-		if let Ok(mut file) = File::open(&path) {
-			let mut buf = vec![];
-			if file.read_to_end(&mut buf).is_ok() {
-				if let Ok(cache) = serde_json::from_slice(&buf[..]) {
-					return cache;
-				}
+		if let Ok(text) = std::fs::read_to_string(&path) {
+			if let Ok(cache) = toml::de::from_str(&text) {
+				return cache;
 			}
 		}
 
-		//There was no file, or the file failed to load, create a new World.
 		ImageCache {
 			path,
 			map: HashMap::new(),
 		}
 	}
 
-	fn insert(&mut self, k: String, v: PathBuf) {
+	fn insert(&mut self, k: (String, u16), v: PathBuf) {
 		self.map.insert(k, v);
 	}
 
 	fn save(&self) {
-		let mut f = File::create(&self.path).unwrap();
-		let buf = serde_json::to_vec(&self).unwrap();
-		f.write_all(&buf[..]).unwrap();
+		std::fs::write(&self.path, toml::ser::to_string_pretty(self).unwrap()).unwrap();
 	}
 }
 
 lazy_static! {
 	static ref IMAGE_CACHE: Mutex<ImageCache> = Mutex::new(ImageCache::new(
-		get_image_cache_dir().join("imagechache.map")
+		get_image_cache_dir().join("imagecache.map")
 	));
 }
 
 fn get_data_dirs() -> Vec<PathBuf> {
-	let xdg_data_dirs_str = std::env::var("XDG_DATA_DIRS").unwrap_or_default();
-
-	let xdg_data_dirs = xdg_data_dirs_str
-		.split(":")
-		.filter_map(|dir| PathBuf::from_str(dir).ok());
-
-	let data_home = dirs::home_dir()
-		.unwrap_or(PathBuf::from_str("/usr/share/").expect(
-			"No XDG_DATA_DIR set, no HOME directory found and no /usr/share direcotry found",
-		))
-		.join(".local")
-		.join("share");
-
-	xdg_data_dirs
-		.chain([data_home].into_iter())
+	std::env::var("XDG_DATA_DIRS") // parse XDG_DATA_DIRS
+		.unwrap_or_default()
+		.split(':')
+		.filter_map(|dir| PathBuf::from_str(dir).ok())
+		.chain(dirs::home_dir().into_iter().map(|d| d.join(".local/share"))) // $HOME/.local/share
+		.chain(PathBuf::from_str("/usr/share")) // /usr/share
+		.chain(PathBuf::from_str("/usr/local/share")) // /usr/local/share
 		.filter(|dir| dir.exists() && dir.is_dir())
+		.unique()
 		.collect()
 }
 
@@ -91,11 +76,9 @@ fn get_app_dirs() -> Vec<PathBuf> {
 		.collect()
 }
 
-pub fn get_desktop_files() -> Vec<PathBuf> {
-	let desktop_extension = OsString::from_str("desktop").unwrap();
+pub fn get_desktop_files() -> impl Iterator<Item = PathBuf> {
 	// Get the list of directories to search
-	let app_dirs = get_app_dirs();
-	app_dirs
+	get_app_dirs()
 		.into_iter()
 		.flat_map(|dir| {
 			// Follow symlinks and recursively search directories
@@ -106,17 +89,15 @@ pub fn get_desktop_files() -> Vec<PathBuf> {
 				.filter(|entry| entry.file_type().is_file())
 				.map(|entry| entry.path().to_path_buf())
 		})
-		.filter(|path| path.extension() == Some(&desktop_extension))
-		.collect::<Vec<PathBuf>>()
+		.filter(|path| path.extension() == Some(&OsString::from_str("desktop").unwrap()))
 }
 
 #[test]
 fn test_get_desktop_files() {
-	let desktop_files = get_desktop_files();
-	dbg!(&desktop_files);
+	let desktop_files = get_desktop_files().collect::<Vec<_>>();
 	assert!(desktop_files
 		.iter()
-		.any(|file| file.ends_with("gimp.desktop")));
+		.any(|file| file.ends_with("com.belmoussaoui.ashpd.demo.desktop")));
 }
 
 pub fn parse_desktop_file(path: PathBuf) -> Result<DesktopFile, String> {
@@ -181,12 +162,7 @@ pub fn parse_desktop_file(path: PathBuf) -> Result<DesktopFile, String> {
 					.collect()
 			}
 			"Icon" => icon = Some(value.to_string()),
-			"NoDisplay" => {
-				no_display = match value {
-					"true" => true,
-					_ => false,
-				}
-			}
+			"NoDisplay" => no_display = value == "true",
 			_ => (), // Ignore unknown keys
 		}
 	}
@@ -232,40 +208,62 @@ pub struct DesktopFile {
 	pub icon: Option<String>,
 	pub no_display: bool,
 }
+
+const ICON_SIZES: [u16; 7] = [512, 256, 128, 64, 48, 32, 24];
+
 impl DesktopFile {
-	pub fn get_raw_icons(&self, preferred_px_size: u16) -> Vec<Icon> {
+	pub fn get_icon(&self, preferred_px_size: u16) -> Option<Icon> {
 		// Get the name of the icon from the DesktopFile struct
-		let Some(icon_name) = self.icon.as_ref() else { return Vec::new(); };
+		let icon_name = self.icon.as_ref()?;
 		let test_icon_path = self.path.join(Path::new(icon_name));
 		if test_icon_path.exists() {
 			if let Some(icon) = Icon::from_path(test_icon_path, preferred_px_size) {
-				return vec![icon];
+				return Some(icon);
 			}
 		}
 
-		if let Some(cache_icon_path) = IMAGE_CACHE.lock().unwrap().map.get(icon_name) {
+		if let Some(cache_icon_path) = IMAGE_CACHE
+			.lock()
+			.unwrap()
+			.map
+			.get(&(icon_name.clone(), preferred_px_size))
+		{
 			if cache_icon_path.exists() {
 				if let Some(icon) = Icon::from_path(cache_icon_path.to_owned(), preferred_px_size) {
-					return vec![icon];
+					return Some(icon);
 				}
 			}
 		}
 
-		let mut icons_iter = linicon::lookup_icon(icon_name)
-			.use_fallback_themes(false)
-			.peekable();
+		let preferred_theme = match linicon_theme::get_icon_theme() {
+			Some(t) => t,
+			None => "hicolor".to_owned(),
+		};
 
-		if icons_iter.peek().is_none() {
-			//dbg!("No icons found in current theme");
-			icons_iter = linicon::lookup_icon(icon_name).peekable();
+		if let Some(icon_path) = lookup(icon_name)
+			.with_size(preferred_px_size)
+			.with_theme(preferred_theme.as_str())
+			.with_greed()
+			.find()
+		{
+			if let Some(icon) = Icon::from_path(icon_path, preferred_px_size) {
+				return Some(icon);
+			}
 		}
 
-		let sized_png: Vec<Icon> = icons_iter
-			.filter_map(|i| i.ok())
-			.filter(|i| i.icon_type != linicon::IconType::XMP) //TODO: support XMP
-			.map(|i| Icon::from_path(i.path, i.max_size - 2).unwrap())
-			.collect();
-		sized_png
+		for icon_size in ICON_SIZES {
+			if let Some(icon_path) = lookup(icon_name)
+				.with_size(icon_size)
+				.with_theme(preferred_theme.as_str())
+				.with_greed()
+				.find()
+			{
+				if let Some(icon) = Icon::from_path(icon_path, preferred_px_size) {
+					return Some(icon);
+				}
+			}
+		}
+		None
 	}
 }
 
@@ -290,35 +288,33 @@ impl Icon {
 			Some("glb") | Some("gltf") => IconType::Gltf,
 			_ => return None,
 		};
-		return Some(Icon {
+		Some(Icon {
 			icon_type,
 			path,
 			size,
-		});
+		})
 	}
 
 	pub fn cached_process(self, size: u16) -> Result<Icon, std::io::Error> {
-		if !IMAGE_CACHE.lock().unwrap().map.contains_key(
-			&self
-				.path
-				.with_extension("")
-				.file_name()
+		let image_name = self
+			.path
+			.with_extension("")
+			.file_name()
+			.unwrap()
+			.to_str()
+			.unwrap()
+			.to_owned();
+
+		if !IMAGE_CACHE
+			.lock()
+			.unwrap()
+			.map
+			.contains_key(&(image_name.clone(), size))
+		{
+			IMAGE_CACHE
+				.lock()
 				.unwrap()
-				.to_str()
-				.unwrap()
-				.to_owned(),
-		) {
-			dbg!("Saving value in the DB");
-			IMAGE_CACHE.lock().unwrap().insert(
-				self.path
-					.with_extension("")
-					.file_name()
-					.unwrap()
-					.to_str()
-					.unwrap()
-					.to_owned(),
-				self.path.clone(),
-			);
+				.insert((image_name, size), self.path.clone());
 			IMAGE_CACHE.lock().unwrap().save();
 		}
 		match self.icon_type {
@@ -336,22 +332,15 @@ fn test_get_icon_path() {
 		name: None,
 		command: None,
 		categories: vec![],
-		icon: Some("krita".into()),
+		icon: Some("com.belmoussaoui.ashpd.demo".into()),
 		no_display: false,
 	};
 
 	// Call the get_icon_path() function with a size argument and store the result
-	let icon_paths = desktop_file.get_raw_icons(32);
-	dbg!(&icon_paths);
+	let icon = desktop_file.get_icon(32);
 
 	// Assert that the get_icon_path() function returns the expected result
-	assert!(icon_paths.contains(
-		&Icon::from_path(
-			PathBuf::from("/usr/share/icons/hicolor/32x32/apps/krita.png"),
-			32
-		)
-		.unwrap()
-	));
+	assert!(icon.is_some());
 }
 
 pub fn get_image_cache_dir() -> PathBuf {
@@ -364,7 +353,7 @@ pub fn get_image_cache_dir() -> PathBuf {
 	}
 	let image_cache_dir = cache_dir.join("protostar_icon_cache");
 	create_dir_all(&image_cache_dir).expect("Could not create image cache directory");
-	return image_cache_dir;
+	image_cache_dir
 }
 
 pub fn get_png_from_svg(svg_path: impl AsRef<Path>, size: u16) -> Result<PathBuf, std::io::Error> {
@@ -374,9 +363,10 @@ pub fn get_png_from_svg(svg_path: impl AsRef<Path>, size: u16) -> Result<PathBuf
 		.map_err(|_| ErrorKind::InvalidData)?;
 
 	let png_path = get_image_cache_dir().join(format!(
-		"{}-{}.png",
+		"{}-{}-{}.png",
 		svg_path.file_name().unwrap().to_str().unwrap(),
-		svg_data.len()
+		svg_data.len(),
+		size
 	));
 
 	if png_path.exists() {
